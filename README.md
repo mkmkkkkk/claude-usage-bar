@@ -2,6 +2,10 @@
 
 A tiny macOS menu bar app that shows your Claude (claude.ai) usage in real time.
 
+![menu bar](screenshot-bar.png)
+
+![dropdown menu](screenshot-menu.png)
+
 - **Top bar** — Session (5-hour window) utilization %
 - **Bottom bar** — Weekly (7-day) utilization %
 - **Countdown** — Time until session reset
