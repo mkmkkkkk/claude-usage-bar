@@ -40,12 +40,19 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <string>ClaudeUsageBar</string>
     <key>LSUIElement</key>
     <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
 </dict>
 </plist>
 PLIST
 
+
+# Copy icon if exists
+if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
+    cp "$SCRIPT_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+fi
 
 echo "✅ Built: $APP_BUNDLE"
 echo ""

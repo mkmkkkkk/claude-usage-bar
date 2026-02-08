@@ -102,8 +102,7 @@ func fetchUsage() -> UsageData {
     }
 
     func parseUtil(_ val: Any?) -> Double {
-        if let i = val as? Int { return Double(i) }
-        if let d = val as? Double { return d }
+        if let n = val as? NSNumber { return n.doubleValue }
         if let s = val as? String {
             return Double(s.replacingOccurrences(of: "%", with: "")) ?? 0
         }
@@ -219,12 +218,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func refreshAsync() {
+    func refreshAsync(retryCount: Int = 0) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let usage = fetchUsage()
             DispatchQueue.main.async {
                 self?.lastUsage = usage
                 self?.updateDisplay()
+
+                // Auto-retry on failure (up to 3 times, every 5s)
+                if usage.error != nil && retryCount < 3 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                        self?.refreshAsync(retryCount: retryCount + 1)
+                    }
+                }
             }
         }
     }
@@ -301,7 +307,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc func refreshClicked() { refreshAsync() }
+    @objc func refreshClicked() {
+        statusItem.menu?.cancelTracking()
+        refreshAsync()
+    }
     @objc func quitClicked() { NSApplication.shared.terminate(nil) }
 }
 
