@@ -2,10 +2,15 @@ import Cocoa
 import Foundation
 
 // ============================================================
-// MARK: - Keychain: Read Claude Code OAuth Token (via CLI)
+// MARK: - Keychain: Read Claude Code credentials
 // ============================================================
 
-func readAccessToken() -> String? {
+struct Credentials {
+    var accessToken: String
+    var planName: String
+}
+
+func readCredentials() -> Credentials? {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
     proc.arguments = [
@@ -32,7 +37,21 @@ func readAccessToken() -> String? {
           let token = oauth["accessToken"] as? String
     else { return nil }
 
-    return token
+    // Parse plan name from subscriptionType
+    let subType = oauth["subscriptionType"] as? String ?? ""
+    let plan: String
+    switch subType.lowercased() {
+    case let s where s.contains("max_200"):  plan = "Claude Max $200"
+    case let s where s.contains("max_100"):  plan = "Claude Max $100"
+    case let s where s.contains("max"):      plan = "Claude Max"
+    case let s where s.contains("pro"):      plan = "Claude Pro"
+    case let s where s.contains("team"):     plan = "Claude Team"
+    case let s where s.contains("enterprise"): plan = "Claude Enterprise"
+    case let s where s.contains("free"):     plan = "Claude Free"
+    default: plan = subType.isEmpty ? "Unknown" : subType
+    }
+
+    return Credentials(accessToken: token, planName: plan)
 }
 
 // ============================================================
@@ -44,16 +63,19 @@ struct UsageData {
     var sessionResetAt: Date? = nil
     var weeklyPct: Double = 0
     var weeklyResetAt: Date? = nil
+    var planName: String = ""
     var error: String? = nil
 }
 
 func fetchUsage() -> UsageData {
     var result = UsageData()
 
-    guard let token = readAccessToken() else {
+    guard let creds = readCredentials() else {
         result.error = "No token"
         return result
     }
+
+    result.planName = creds.planName
 
     guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
         result.error = "Bad URL"
@@ -62,7 +84,7 @@ func fetchUsage() -> UsageData {
 
     var request = URLRequest(url: url, timeoutInterval: 15)
     request.httpMethod = "GET"
-    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    request.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("claude-code/2.1.5", forHTTPHeaderField: "User-Agent")
     request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
@@ -187,11 +209,24 @@ func formatCountdown(to resetDate: Date?) -> String {
     let totalMin = Int(ceil(remaining / 60))
     let hrs = totalMin / 60
     let mins = totalMin % 60
+    let days = hrs / 24
+    let remHrs = hrs % 24
 
+    if days > 0 {
+        return "\(days)d \(remHrs)h"
+    }
     if hrs > 0 {
         return "\(hrs)h\(String(format: "%02d", mins))m"
     }
     return "\(mins)m"
+}
+
+func formatTime(_ date: Date?) -> String {
+    guard let date = date else { return "-" }
+    let fmt = DateFormatter()
+    fmt.dateFormat = "M/d h:mm a"
+    fmt.timeZone = .current
+    return fmt.string(from: date)
 }
 
 // ============================================================
@@ -214,6 +249,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshAsync()
 
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.refreshAsync()
+        }
+
+        // Refresh on wake from sleep
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(onWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    @objc func onWake() {
+        // Small delay for network to reconnect
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             self?.refreshAsync()
         }
     }
@@ -247,17 +297,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             btn.imagePosition = .imageLeft
             btn.title = countdown.isEmpty ? "" : " \(countdown)"
             btn.font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
-        }
+}
 
         let menu = NSMenu()
 
-        let hdr = NSMenuItem(title: "Claude Usage", action: nil, keyEquivalent: "")
+        // Header with plan name
+        let planLabel = usage.planName.isEmpty ? "Claude Usage" : "Claude Usage  ·  \(usage.planName)"
+        let hdr = NSMenuItem(title: planLabel, action: nil, keyEquivalent: "")
         hdr.isEnabled = false
         menu.addItem(hdr)
         menu.addItem(NSMenuItem.separator())
 
         if let err = usage.error {
-            // Show error visibly in the bar itself
             if let btn = statusItem.button {
                 btn.image = nil
                 btn.title = " C:err"
@@ -275,23 +326,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 menu.addItem(hint)
             }
         } else {
-            let sReset = formatCountdown(to: usage.sessionResetAt)
             let sPct = String(format: "%.0f%%", usage.sessionPct)
-            let sItem = NSMenuItem(
-                title: "Session: \(sPct)  reset \(sReset.isEmpty ? "-" : sReset)",
-                action: nil, keyEquivalent: ""
-            )
-            sItem.isEnabled = false
-            menu.addItem(sItem)
+            let s1 = NSMenuItem(title: "Session:  \(sPct)", action: nil, keyEquivalent: "")
+            s1.isEnabled = false
+            menu.addItem(s1)
 
-            let wReset = formatCountdown(to: usage.weeklyResetAt)
+            let sCountdown = formatCountdown(to: usage.sessionResetAt)
+            let sTime = formatTime(usage.sessionResetAt)
+            let s2 = NSMenuItem(title: "   Reset:  \(sCountdown.isEmpty ? "-" : sCountdown)  (\(sTime))", action: nil, keyEquivalent: "")
+            s2.isEnabled = false
+            menu.addItem(s2)
+
+            menu.addItem(NSMenuItem.separator())
+
             let wPct = String(format: "%.0f%%", usage.weeklyPct)
-            let wItem = NSMenuItem(
-                title: "Weekly:  \(wPct)  reset \(wReset.isEmpty ? "-" : wReset)",
-                action: nil, keyEquivalent: ""
-            )
-            wItem.isEnabled = false
-            menu.addItem(wItem)
+            let w1 = NSMenuItem(title: "Weekly:   \(wPct)", action: nil, keyEquivalent: "")
+            w1.isEnabled = false
+            menu.addItem(w1)
+
+            let wCountdown = formatCountdown(to: usage.weeklyResetAt)
+            let wTime = formatTime(usage.weeklyResetAt)
+            let w2 = NSMenuItem(title: "   Reset:  \(wCountdown.isEmpty ? "-" : wCountdown)  (\(wTime))", action: nil, keyEquivalent: "")
+            w2.isEnabled = false
+            menu.addItem(w2)
         }
 
         menu.addItem(NSMenuItem.separator())
