@@ -41,6 +41,8 @@ func readCredentials() -> Credentials? {
     let subType = oauth["subscriptionType"] as? String ?? ""
     let plan: String
     switch subType.lowercased() {
+    case let s where s.contains("20x"):      plan = "Claude Max 20x"
+    case let s where s.contains("5x"):       plan = "Claude Max 5x"
     case let s where s.contains("max_200"):  plan = "Claude Max $200"
     case let s where s.contains("max_100"):  plan = "Claude Max $100"
     case let s where s.contains("max"):      plan = "Claude Max"
@@ -213,7 +215,7 @@ func formatCountdown(to resetDate: Date?) -> String {
     let remHrs = hrs % 24
 
     if days > 0 {
-        return "\(days)d \(remHrs)h"
+        return "\(days)d\(String(format: "%02d", remHrs))h"
     }
     if hrs > 0 {
         return "\(hrs)h\(String(format: "%02d", mins))m"
@@ -326,29 +328,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 menu.addItem(hint)
             }
         } else {
-            let sPct = String(format: "%.0f%%", usage.sessionPct)
-            let s1 = NSMenuItem(title: "Session:  \(sPct)", action: nil, keyEquivalent: "")
-            s1.isEnabled = false
-            menu.addItem(s1)
-
             let sCountdown = formatCountdown(to: usage.sessionResetAt)
-            let sTime = formatTime(usage.sessionResetAt)
-            let s2 = NSMenuItem(title: "   Reset:  \(sCountdown.isEmpty ? "-" : sCountdown)  (\(sTime))", action: nil, keyEquivalent: "")
-            s2.isEnabled = false
-            menu.addItem(s2)
-
-            menu.addItem(NSMenuItem.separator())
-
-            let wPct = String(format: "%.0f%%", usage.weeklyPct)
-            let w1 = NSMenuItem(title: "Weekly:   \(wPct)", action: nil, keyEquivalent: "")
-            w1.isEnabled = false
-            menu.addItem(w1)
+            let sPct = String(format: "%.0f%%", usage.sessionPct)
+            let sItem = NSMenuItem(
+                title: "Session: \(sPct) · reset \(sCountdown.isEmpty ? "-" : sCountdown)",
+                action: nil, keyEquivalent: ""
+            )
+            sItem.isEnabled = false
+            menu.addItem(sItem)
 
             let wCountdown = formatCountdown(to: usage.weeklyResetAt)
             let wTime = formatTime(usage.weeklyResetAt)
-            let w2 = NSMenuItem(title: "   Reset:  \(wCountdown.isEmpty ? "-" : wCountdown)  (\(wTime))", action: nil, keyEquivalent: "")
-            w2.isEnabled = false
-            menu.addItem(w2)
+            let wPct = String(format: "%.0f%%", usage.weeklyPct)
+            let wItem = NSMenuItem(
+                title: "Weekly: \(wPct) · reset \(wCountdown.isEmpty ? "-" : wCountdown) (\(wTime))",
+                action: nil, keyEquivalent: ""
+            )
+            wItem.isEnabled = false
+            menu.addItem(wItem)
         }
 
         menu.addItem(NSMenuItem.separator())
