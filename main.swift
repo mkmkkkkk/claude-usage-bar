@@ -1,8 +1,59 @@
 import Cocoa
 import Foundation
+import Network
 
 // ============================================================
-// MARK: - Keychain: Read Claude Code credentials
+// MARK: - Logger (rotating file log)
+// ============================================================
+
+class Log {
+    static let shared = Log()
+    private let logURL: URL
+    private let maxSize = 512 * 1024  // 500KB
+    private let queue = DispatchQueue(label: "com.tensor.usage-bar.log")
+    private let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    private init() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        logURL = home.appendingPathComponent("Library/Logs/ClaudeUsageBar.log")
+    }
+
+    func info(_ msg: String) { write("INFO", msg) }
+    func warn(_ msg: String) { write("WARN", msg) }
+    func error(_ msg: String) { write("ERR ", msg) }
+
+    private func write(_ level: String, _ msg: String) {
+        let line = "[\(fmt.string(from: Date()))] \(level) \(msg)\n"
+        queue.async { [self] in
+            rotateIfNeeded()
+            guard let data = line.data(using: .utf8) else { return }
+            if FileManager.default.fileExists(atPath: logURL.path) {
+                if let h = try? FileHandle(forWritingTo: logURL) {
+                    h.seekToEndOfFile()
+                    h.write(data)
+                    h.closeFile()
+                }
+            } else {
+                try? data.write(to: logURL)
+            }
+        }
+    }
+
+    private func rotateIfNeeded() {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+              let size = attrs[.size] as? Int, size > maxSize else { return }
+        let old = logURL.deletingPathExtension().appendingPathExtension("old.log")
+        try? FileManager.default.removeItem(at: old)
+        try? FileManager.default.moveItem(at: logURL, to: old)
+    }
+}
+
+// ============================================================
+// MARK: - Keychain (cached)
 // ============================================================
 
 struct Credentials {
@@ -10,7 +61,18 @@ struct Credentials {
     var planName: String
 }
 
-func readCredentials() -> Credentials? {
+private var _cachedCreds: Credentials?
+private var _cachedCredsAt: Date?
+private let credsCacheTTL: TimeInterval = 300  // 5 min
+
+func readCredentials(forceRefresh: Bool = false) -> Credentials? {
+    if !forceRefresh,
+       let cached = _cachedCreds,
+       let at = _cachedCredsAt,
+       Date().timeIntervalSince(at) < credsCacheTTL {
+        return cached
+    }
+
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
     proc.arguments = [
@@ -24,10 +86,16 @@ func readCredentials() -> Credentials? {
     proc.standardOutput = pipe
     proc.standardError = Pipe()
 
-    do { try proc.run() } catch { return nil }
+    do { try proc.run() } catch {
+        Log.shared.error("Keychain process launch failed")
+        return nil
+    }
     proc.waitUntilExit()
 
-    guard proc.terminationStatus == 0 else { return nil }
+    guard proc.terminationStatus == 0 else {
+        Log.shared.warn("Keychain lookup failed (status \(proc.terminationStatus))")
+        return nil
+    }
 
     let raw = pipe.fileHandleForReading.readDataToEndOfFile()
     guard let jsonStr = String(data: raw, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -37,7 +105,6 @@ func readCredentials() -> Credentials? {
           let token = oauth["accessToken"] as? String
     else { return nil }
 
-    // Parse plan name from subscriptionType
     let subType = oauth["subscriptionType"] as? String ?? ""
     let plan: String
     switch subType.lowercased() {
@@ -53,27 +120,72 @@ func readCredentials() -> Credentials? {
     default: plan = subType.isEmpty ? "Unknown" : subType
     }
 
-    return Credentials(accessToken: token, planName: plan)
+    let creds = Credentials(accessToken: token, planName: plan)
+    _cachedCreds = creds
+    _cachedCredsAt = Date()
+    Log.shared.info("Credentials loaded (\(plan))")
+    return creds
 }
 
 // ============================================================
-// MARK: - API: Fetch Usage
+// MARK: - API (async/await)
 // ============================================================
 
-struct UsageData {
+struct UsageData: Equatable {
     var sessionPct: Double = 0
     var sessionResetAt: Date? = nil
     var weeklyPct: Double = 0
     var weeklyResetAt: Date? = nil
     var planName: String = ""
     var error: String? = nil
+    var errorKind: ErrorKind = .none
+
+    static func == (lhs: UsageData, rhs: UsageData) -> Bool {
+        lhs.sessionPct == rhs.sessionPct &&
+        lhs.weeklyPct == rhs.weeklyPct &&
+        lhs.sessionResetAt == rhs.sessionResetAt &&
+        lhs.weeklyResetAt == rhs.weeklyResetAt &&
+        lhs.planName == rhs.planName &&
+        lhs.error == rhs.error
+    }
 }
 
-func fetchUsage() -> UsageData {
+enum ErrorKind: Equatable {
+    case none
+    case noToken
+    case networkOffline
+    case networkTimeout
+    case httpError(Int)
+    case parseError
+    case unknown
+
+    var isTransient: Bool {
+        switch self {
+        case .networkOffline, .networkTimeout, .unknown:
+            return true
+        case .httpError(let code):
+            return code == 429 || (500...599).contains(code)
+        default:
+            return false
+        }
+    }
+}
+
+private let apiSession: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = 20
+    config.timeoutIntervalForResource = 30
+    config.waitsForConnectivity = false
+    config.requestCachePolicy = .reloadIgnoringLocalCacheData
+    return URLSession(configuration: config)
+}()
+
+func fetchUsage() async -> UsageData {
     var result = UsageData()
 
     guard let creds = readCredentials() else {
         result.error = "No token"
+        result.errorKind = .noToken
         return result
     }
 
@@ -81,37 +193,78 @@ func fetchUsage() -> UsageData {
 
     guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
         result.error = "Bad URL"
+        result.errorKind = .unknown
         return result
     }
 
-    var request = URLRequest(url: url, timeoutInterval: 15)
+    var request = URLRequest(url: url)
     request.httpMethod = "GET"
     request.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("claude-code/2.1.5", forHTTPHeaderField: "User-Agent")
     request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
 
-    let semaphore = DispatchSemaphore(value: 0)
-    var responseData: Data?
-    var responseError: Error?
-
-    URLSession.shared.dataTask(with: request) { data, _, error in
-        responseData = data
-        responseError = error
-        semaphore.signal()
-    }.resume()
-
-    semaphore.wait()
-
-    if let err = responseError {
-        result.error = err.localizedDescription
+    let data: Data
+    let response: URLResponse
+    do {
+        (data, response) = try await apiSession.data(for: request)
+    } catch {
+        let nsErr = error as NSError
+        switch nsErr.code {
+        case NSURLErrorNotConnectedToInternet,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorDataNotAllowed,
+             NSURLErrorInternationalRoamingOff:
+            result.error = "Offline"
+            result.errorKind = .networkOffline
+        case NSURLErrorTimedOut:
+            result.error = "Timeout"
+            result.errorKind = .networkTimeout
+        case NSURLErrorCannotFindHost,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorDNSLookupFailed:
+            result.error = "DNS/Host"
+            result.errorKind = .networkOffline
+        case NSURLErrorSecureConnectionFailed,
+             NSURLErrorServerCertificateHasBadDate,
+             NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasUnknownRoot,
+             NSURLErrorServerCertificateNotYetValid,
+             NSURLErrorClientCertificateRejected:
+            result.error = "TLS error"
+            result.errorKind = .networkTimeout
+        default:
+            result.error = error.localizedDescription
+            result.errorKind = .unknown
+        }
+        Log.shared.error("Fetch failed: \(result.error ?? "?")")
         return result
     }
 
-    guard let data = responseData,
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    if let httpResp = response as? HTTPURLResponse, httpResp.statusCode != 200 {
+        let code = httpResp.statusCode
+        switch code {
+        case 401:
+            result.error = "Auth expired"
+            result.errorKind = .httpError(401)
+        case 429:
+            result.error = "Rate limited"
+            result.errorKind = .httpError(429)
+        case 500...599:
+            result.error = "Server \(code)"
+            result.errorKind = .httpError(code)
+        default:
+            result.error = "HTTP \(code)"
+            result.errorKind = .httpError(code)
+        }
+        Log.shared.error("HTTP \(code)")
+        return result
+    }
+
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else {
         result.error = "Parse error"
+        result.errorKind = .parseError
         return result
     }
 
@@ -144,6 +297,136 @@ func fetchUsage() -> UsageData {
     }
 
     return result
+}
+
+// ============================================================
+// MARK: - Sparkline History
+// ============================================================
+
+struct UsagePoint {
+    let date: Date
+    let sessionPct: Double
+    let weeklyPct: Double
+}
+
+class UsageHistory {
+    static let maxPoints = 360  // 6h at 60s intervals
+    private(set) var points: [UsagePoint] = []
+
+    func record(_ usage: UsageData) {
+        let pt = UsagePoint(date: Date(), sessionPct: usage.sessionPct, weeklyPct: usage.weeklyPct)
+        points.append(pt)
+        if points.count > Self.maxPoints {
+            points.removeFirst(points.count - Self.maxPoints)
+        }
+    }
+}
+
+class SparklineView: NSView {
+    var points: [UsagePoint] = []
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 230, height: 60)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let margin: CGFloat = 10
+        let topPad: CGFloat = 14
+        let botPad: CGFloat = 16
+        let chartRect = NSRect(
+            x: margin, y: botPad,
+            width: bounds.width - margin * 2,
+            height: bounds.height - topPad - botPad
+        )
+
+        // Title
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        "Trend".draw(at: NSPoint(x: margin, y: bounds.height - topPad + 2), withAttributes: titleAttrs)
+
+        guard points.count >= 2 else {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: NSColor.tertiaryLabelColor
+            ]
+            let text = "Collecting data..."
+            let size = text.size(withAttributes: attrs)
+            text.draw(
+                at: NSPoint(x: (bounds.width - size.width) / 2, y: (chartRect.midY - size.height / 2)),
+                withAttributes: attrs
+            )
+            return
+        }
+
+        // Grid lines at 50% and 100%
+        let gridColor = NSColor.separatorColor.withAlphaComponent(0.3)
+        for pct in [0.5, 1.0] {
+            let y = chartRect.minY + chartRect.height * CGFloat(pct)
+            let line = NSBezierPath()
+            line.move(to: NSPoint(x: chartRect.minX, y: y))
+            line.line(to: NSPoint(x: chartRect.maxX, y: y))
+            line.lineWidth = 0.5
+            gridColor.setStroke()
+            line.stroke()
+        }
+
+        // Draw sparklines
+        drawLine(points.map { $0.sessionPct }, in: chartRect,
+                 color: NSColor.systemBlue, label: "S", labelX: chartRect.maxX + 2)
+        drawLine(points.map { $0.weeklyPct }, in: chartRect,
+                 color: NSColor.systemOrange, label: "W", labelX: chartRect.maxX + 2)
+
+        // Time labels
+        let timeAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
+            .foregroundColor: NSColor.tertiaryLabelColor
+        ]
+
+        let elapsed = points.last!.date.timeIntervalSince(points.first!.date)
+        let agoLabel: String
+        if elapsed >= 3600 {
+            agoLabel = String(format: "%.0fh ago", elapsed / 3600)
+        } else {
+            agoLabel = String(format: "%.0fm ago", elapsed / 60)
+        }
+        agoLabel.draw(at: NSPoint(x: margin, y: 2), withAttributes: timeAttrs)
+
+        let nowSize = "now".size(withAttributes: timeAttrs)
+        "now".draw(at: NSPoint(x: chartRect.maxX - nowSize.width, y: 2), withAttributes: timeAttrs)
+    }
+
+    private func drawLine(_ values: [Double], in rect: NSRect, color: NSColor,
+                          label: String, labelX: CGFloat) {
+        guard values.count >= 2 else { return }
+        let path = NSBezierPath()
+        path.lineWidth = 1.5
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+
+        let step = rect.width / CGFloat(values.count - 1)
+
+        for (i, val) in values.enumerated() {
+            let x = rect.minX + CGFloat(i) * step
+            let y = rect.minY + rect.height * CGFloat(min(val, 100.0) / 100.0)
+            if i == 0 { path.move(to: NSPoint(x: x, y: y)) }
+            else { path.line(to: NSPoint(x: x, y: y)) }
+        }
+
+        color.setStroke()
+        path.stroke()
+
+        // Fill under curve
+        let fillPath = path.copy() as! NSBezierPath
+        fillPath.line(to: NSPoint(x: rect.maxX, y: rect.minY))
+        fillPath.line(to: NSPoint(x: rect.minX, y: rect.minY))
+        fillPath.close()
+        color.withAlphaComponent(0.08).setFill()
+        fillPath.fill()
+    }
 }
 
 // ============================================================
@@ -238,115 +521,97 @@ func formatTime(_ date: Date?) -> String {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
+    var watchdogTimer: Timer?
     var lastUsage = UsageData()
+    var lastSuccessfulUsage: UsageData?
+    var lastSuccessfulFetch: Date?
+    var consecutiveFailures = 0
+    var networkMonitor: NWPathMonitor?
+    private var _isNetworkAvailable = true
+    var isNetworkAvailable: Bool { _isNetworkAvailable }
+    var isRefreshing = false
+    var pendingRetryWork: DispatchWorkItem?
+
+    // Sparkline
+    let usageHistory = UsageHistory()
+    var sparklineView: SparklineView!
+
+    // Persistent menu items (differential update)
+    var headerItem: NSMenuItem!
+    var sessionItem: NSMenuItem!
+    var weeklyItem: NSMenuItem!
+    var staleNoteItem: NSMenuItem!
+    var errorItem: NSMenuItem!
+    var hintItem: NSMenuItem!
+    var sparklineSepItem: NSMenuItem!
+    var sparklineItem: NSMenuItem!
+
+    static let backoffDelays: [TimeInterval] = [5, 15, 30, 60, 120]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        Log.shared.info("App launched")
 
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             btn.title = " C:..."
             btn.font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
         }
 
+        buildMenu()
+        startNetworkMonitor()
         refreshAsync()
+        startRefreshTimer()
 
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.refreshAsync()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
+            self?.ensureTimerAlive()
         }
 
-        // Refresh on wake from sleep
         NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(onWake),
-            name: NSWorkspace.didWakeNotification,
-            object: nil
+            self, selector: #selector(onWake),
+            name: NSWorkspace.didWakeNotification, object: nil
         )
     }
 
-    @objc func onWake() {
-        // Small delay for network to reconnect
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            self?.refreshAsync()
-        }
-    }
+    // MARK: - Menu (built once, updated differentially)
 
-    func refreshAsync(retryCount: Int = 0) {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let usage = fetchUsage()
-            DispatchQueue.main.async {
-                self?.lastUsage = usage
-                self?.updateDisplay()
-
-                // Auto-retry on failure (up to 3 times, every 5s)
-                if usage.error != nil && retryCount < 3 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                        self?.refreshAsync(retryCount: retryCount + 1)
-                    }
-                }
-            }
-        }
-    }
-
-    func updateDisplay() {
-        let usage = lastUsage
-
-        let topFrac = usage.sessionPct / 100.0
-        let botFrac = usage.weeklyPct / 100.0
-        let countdown = formatCountdown(to: usage.sessionResetAt)
-
-        if let btn = statusItem.button {
-            btn.image = makeBarImage(topFrac: topFrac, botFrac: botFrac)
-            btn.imagePosition = .imageLeft
-            btn.title = countdown.isEmpty ? "" : " \(countdown)"
-            btn.font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
-}
-
+    func buildMenu() {
         let menu = NSMenu()
 
-        // Header with plan name
-        let planLabel = usage.planName.isEmpty ? "Claude Usage" : "Claude Usage  ·  \(usage.planName)"
-        let hdr = NSMenuItem(title: planLabel, action: nil, keyEquivalent: "")
-        hdr.isEnabled = false
-        menu.addItem(hdr)
+        headerItem = NSMenuItem(title: "Claude Usage", action: nil, keyEquivalent: "")
+        headerItem.isEnabled = false
+        menu.addItem(headerItem)
         menu.addItem(NSMenuItem.separator())
 
-        if let err = usage.error {
-            if let btn = statusItem.button {
-                btn.image = nil
-                btn.title = " C:err"
-            }
-            let errItem = NSMenuItem(title: "Error: \(err)", action: nil, keyEquivalent: "")
-            errItem.isEnabled = false
-            menu.addItem(errItem)
+        sessionItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        sessionItem.isEnabled = false
+        menu.addItem(sessionItem)
 
-            if err == "No token" {
-                let hint = NSMenuItem(
-                    title: "Keychain access needed - relaunch & click Allow",
-                    action: nil, keyEquivalent: ""
-                )
-                hint.isEnabled = false
-                menu.addItem(hint)
-            }
-        } else {
-            let sCountdown = formatCountdown(to: usage.sessionResetAt)
-            let sPct = String(format: "%.0f%%", usage.sessionPct)
-            let sItem = NSMenuItem(
-                title: "Session: \(sPct) · reset \(sCountdown.isEmpty ? "-" : sCountdown)",
-                action: nil, keyEquivalent: ""
-            )
-            sItem.isEnabled = false
-            menu.addItem(sItem)
+        weeklyItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        weeklyItem.isEnabled = false
+        menu.addItem(weeklyItem)
 
-            let wCountdown = formatCountdown(to: usage.weeklyResetAt)
-            let wTime = formatTime(usage.weeklyResetAt)
-            let wPct = String(format: "%.0f%%", usage.weeklyPct)
-            let wItem = NSMenuItem(
-                title: "Weekly: \(wPct) · reset \(wCountdown.isEmpty ? "-" : wCountdown) (\(wTime))",
-                action: nil, keyEquivalent: ""
-            )
-            wItem.isEnabled = false
-            menu.addItem(wItem)
-        }
+        staleNoteItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        staleNoteItem.isEnabled = false
+        staleNoteItem.isHidden = true
+        menu.addItem(staleNoteItem)
+
+        errorItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        errorItem.isEnabled = false
+        errorItem.isHidden = true
+        menu.addItem(errorItem)
+
+        hintItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        hintItem.isEnabled = false
+        hintItem.isHidden = true
+        menu.addItem(hintItem)
+
+        sparklineSepItem = NSMenuItem.separator()
+        menu.addItem(sparklineSepItem)
+
+        sparklineView = SparklineView(frame: NSRect(x: 0, y: 0, width: 230, height: 60))
+        sparklineItem = NSMenuItem()
+        sparklineItem.view = sparklineView
+        menu.addItem(sparklineItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -361,10 +626,216 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    // MARK: - Network Monitoring
+
+    func startNetworkMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let wasOffline = !self._isNetworkAvailable
+                self._isNetworkAvailable = (path.status == .satisfied)
+
+                if wasOffline && path.status == .satisfied {
+                    Log.shared.info("Network restored")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                        self?.consecutiveFailures = 0
+                        self?.refreshAsync()
+                    }
+                } else if !wasOffline && path.status != .satisfied {
+                    Log.shared.warn("Network lost")
+                }
+            }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        networkMonitor = monitor
+    }
+
+    // MARK: - Timer management
+
+    func startRefreshTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.refreshAsync()
+        }
+    }
+
+    func ensureTimerAlive() {
+        if timer == nil || !(timer?.isValid ?? false) {
+            Log.shared.warn("Timer was dead, restarting")
+            startRefreshTimer()
+        }
+    }
+
+    @objc func onWake() {
+        Log.shared.info("Wake from sleep")
+        _cachedCredsAt = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.consecutiveFailures = 0
+            self?.refreshAsync()
+        }
+    }
+
+    // MARK: - Fetch (async/await)
+
+    func refreshAsync() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        pendingRetryWork?.cancel()
+        pendingRetryWork = nil
+
+        Task {
+            let usage = await fetchUsage()
+
+            // Back to main thread for UI
+            await MainActor.run {
+                self.isRefreshing = false
+                self.lastUsage = usage
+
+                if usage.error != nil {
+                    self.consecutiveFailures += 1
+                    if case .httpError(401) = usage.errorKind {
+                        _cachedCredsAt = nil
+                    }
+                    self.scheduleRetry()
+                } else {
+                    if self.consecutiveFailures > 0 {
+                        Log.shared.info("Recovered after \(self.consecutiveFailures) failures")
+                    }
+                    self.consecutiveFailures = 0
+                    self.lastSuccessfulUsage = usage
+                    self.lastSuccessfulFetch = Date()
+                    self.usageHistory.record(usage)
+                    Log.shared.info("S:\(String(format: "%.0f", usage.sessionPct))% W:\(String(format: "%.0f", usage.weeklyPct))%")
+                }
+
+                self.updateDisplay()
+            }
+        }
+    }
+
+    func scheduleRetry() {
+        if case .noToken = lastUsage.errorKind { return }
+        if case .httpError(401) = lastUsage.errorKind { return }
+        if !isNetworkAvailable { return }
+
+        let idx = min(consecutiveFailures - 1, Self.backoffDelays.count - 1)
+        let delay = Self.backoffDelays[max(idx, 0)]
+        Log.shared.info("Retry #\(consecutiveFailures) in \(Int(delay))s")
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.refreshAsync()
+        }
+        pendingRetryWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    // MARK: - UI (differential update)
+
+    func updateDisplay() {
+        let usage = lastUsage
+        let hasError = usage.error != nil
+
+        let displayUsage: UsageData
+        if hasError && usage.errorKind.isTransient, let stale = lastSuccessfulUsage {
+            displayUsage = stale
+        } else {
+            displayUsage = usage
+        }
+
+        let topFrac = displayUsage.sessionPct / 100.0
+        let botFrac = displayUsage.weeklyPct / 100.0
+        let countdown = formatCountdown(to: displayUsage.sessionResetAt)
+
+        // -- Status bar button --
+        if let btn = statusItem.button {
+            if hasError && lastSuccessfulFetch != nil && usage.errorKind.isTransient {
+                btn.image = makeBarImage(topFrac: topFrac, botFrac: botFrac)
+                btn.imagePosition = .imageLeft
+                btn.title = " \(usage.error!)"
+            } else if hasError {
+                btn.image = nil
+                btn.title = " C:\(usage.error!)"
+            } else {
+                btn.image = makeBarImage(topFrac: topFrac, botFrac: botFrac)
+                btn.imagePosition = .imageLeft
+                btn.title = countdown.isEmpty ? "" : " \(countdown)"
+            }
+            btn.font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
+        }
+
+        // -- Menu items (update titles, toggle visibility) --
+        let planName = displayUsage.planName.isEmpty ? usage.planName : displayUsage.planName
+        headerItem.title = planName.isEmpty ? "Claude Usage" : "Claude Usage  ·  \(planName)"
+
+        // Session & Weekly
+        let showUsageRows = !hasError || (lastSuccessfulFetch != nil && usage.errorKind.isTransient)
+
+        if showUsageRows {
+            sessionItem.isHidden = false
+            weeklyItem.isHidden = false
+
+            let sCountdown = formatCountdown(to: displayUsage.sessionResetAt)
+            let sPct = String(format: "%.0f%%", displayUsage.sessionPct)
+            sessionItem.title = "Session: \(sPct) · reset \(sCountdown.isEmpty ? "-" : sCountdown)"
+
+            let wCountdown = formatCountdown(to: displayUsage.weeklyResetAt)
+            let wTime = formatTime(displayUsage.weeklyResetAt)
+            let wPct = String(format: "%.0f%%", displayUsage.weeklyPct)
+            weeklyItem.title = "Weekly: \(wPct) · reset \(wCountdown.isEmpty ? "-" : wCountdown) (\(wTime))"
+        } else {
+            sessionItem.isHidden = true
+            weeklyItem.isHidden = true
+        }
+
+        // Stale note
+        if hasError && lastSuccessfulFetch != nil && usage.errorKind.isTransient {
+            staleNoteItem.isHidden = false
+            staleNoteItem.title = "Last updated: \(formatTime(lastSuccessfulFetch))"
+        } else {
+            staleNoteItem.isHidden = true
+        }
+
+        // Error + hint
+        if let err = usage.error {
+            errorItem.isHidden = false
+            errorItem.title = "Error: \(err)"
+
+            hintItem.isHidden = false
+            switch usage.errorKind {
+            case .noToken:
+                hintItem.title = "Keychain access needed - relaunch & click Allow"
+            case .httpError(401):
+                hintItem.title = "Token expired - re-login to claude.ai"
+            case .httpError(429):
+                hintItem.title = "Rate limited - will retry automatically"
+            case .networkOffline:
+                hintItem.title = "No internet - will refresh when online"
+            case .networkTimeout:
+                hintItem.title = "Request timed out - retrying..."
+            default:
+                if consecutiveFailures > 0 {
+                    hintItem.title = "Retrying... (\(consecutiveFailures) failures)"
+                } else {
+                    hintItem.isHidden = true
+                }
+            }
+        } else {
+            errorItem.isHidden = true
+            hintItem.isHidden = true
+        }
+
+        // Sparkline
+        sparklineView.points = usageHistory.points
+        sparklineView.needsDisplay = true
+    }
+
     @objc func refreshClicked() {
         statusItem.menu?.cancelTracking()
+        consecutiveFailures = 0
         refreshAsync()
     }
+
     @objc func quitClicked() { NSApplication.shared.terminate(nil) }
 }
 

@@ -56,5 +56,9 @@ fi
 
 echo "✅ Built: $APP_BUNDLE"
 echo ""
-echo "Run:     open $APP_BUNDLE"
-echo "Install: cp -r $APP_BUNDLE /Applications/"
+echo "Run:       open $APP_BUNDLE"
+echo "Install:   cp -r $APP_BUNDLE /Applications/"
+echo ""
+echo "Auto-restart (LaunchAgent):"
+echo "  cp $SCRIPT_DIR/com.tensor.claude-usage-bar.plist ~/Library/LaunchAgents/"
+echo "  launchctl load ~/Library/LaunchAgents/com.tensor.claude-usage-bar.plist"

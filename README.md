@@ -1,52 +1,54 @@
 # Claude Usage Bar
 
-A tiny macOS menu bar app that shows your Claude (claude.ai) usage in real time.
+macOS menu bar app showing Claude API usage (session + weekly) in real time.
 
-![menu bar](screenshot-bar.png)
+## Features
 
-![dropdown menu](screenshot-menu.png)
+- **Dual progress bars** in menu bar — top = session (5h), bottom = weekly (7d)
+- **Countdown timer** — time until session reset
+- **Sparkline trend** — 6h usage history chart in dropdown (session blue / weekly orange)
+- **Auto-reconnect** — NWPathMonitor detects network changes, refreshes on reconnect
+- **Exponential backoff** — retries on failure (5s → 15s → 30s → 60s → 120s)
+- **Crash recovery** — LaunchAgent auto-restarts on crash
+- **Stale data display** — shows last known data during transient errors
+- **Structured logging** — `~/Library/Logs/ClaudeUsageBar.log` (500KB rotating)
 
-- **Top bar** — Session (5-hour window) utilization %
-- **Bottom bar** — Weekly (7-day) utilization %
-- **Countdown** — Time until session reset
+## Build & Install
 
-Data comes directly from Anthropic's API using your Claude Code OAuth token (stored in macOS Keychain).
+```bash
+./build.sh
+cp -r build/ClaudeUsageBar.app /Applications/
+```
+
+## Auto-start (LaunchAgent)
+
+```bash
+cp com.tensor.claude-usage-bar.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.tensor.claude-usage-bar.plist
+```
+
+Unload: `launchctl unload ~/Library/LaunchAgents/com.tensor.claude-usage-bar.plist`
 
 ## Requirements
 
 - macOS 13+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (this stores the OAuth token the app reads)
+- Claude Code logged in (credentials in Keychain)
 
-## Build & Run
+## Architecture
+
+Single-file Swift app (`main.swift`), compiled with `swiftc -O -framework Cocoa`.
+
+| Component | Detail |
+|-----------|--------|
+| Network | async/await URLSession, NWPathMonitor |
+| Credentials | Keychain read via `/usr/bin/security`, 5min cache |
+| UI | NSStatusItem, differential NSMenu update |
+| Polling | 60s timer + watchdog (120s) |
+| Retry | Exponential backoff, skip non-transient errors (401, no token) |
+| Logging | Rotating file log with INFO/WARN/ERR levels |
+
+## Debugging
 
 ```bash
-chmod +x build.sh
-./build.sh
-open build/ClaudeUsageBar.app
+tail -f ~/Library/Logs/ClaudeUsageBar.log
 ```
-
-On first launch, macOS will ask for Keychain access to "Claude Code-credentials" — click **Always Allow**.
-
-## Install
-
-```bash
-cp -r build/ClaudeUsageBar.app /Applications/
-```
-
-To auto-start on login: System Settings > General > Login Items > add ClaudeUsageBar.
-
-## How It Works
-
-1. Reads OAuth token from macOS Keychain (`Claude Code-credentials`)
-2. Calls `GET https://api.anthropic.com/api/oauth/usage` with Bearer auth
-3. Parses `five_hour` (session) and `seven_day` (weekly) utilization percentages
-4. Renders two thin bars + countdown timer in the menu bar
-5. Refreshes every 60 seconds
-
-## Tech
-
-Single-file Swift app (~300 lines), no dependencies, no Xcode required. Just `swiftc`.
-
-## License
-
-MIT
