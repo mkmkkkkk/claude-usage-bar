@@ -58,18 +58,28 @@ class Log {
 
 struct Credentials {
     var accessToken: String
+    var refreshToken: String
+    var expiresAt: Date?
     var planName: String
+
+    var isExpired: Bool {
+        guard let exp = expiresAt else { return false }
+        return Date() >= exp.addingTimeInterval(-120)  // 2 min buffer
+    }
 }
 
 private var _cachedCreds: Credentials?
 private var _cachedCredsAt: Date?
 private let credsCacheTTL: TimeInterval = 300  // 5 min
+private let oauthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+private let oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
 
 func readCredentials(forceRefresh: Bool = false) -> Credentials? {
     if !forceRefresh,
        let cached = _cachedCreds,
        let at = _cachedCredsAt,
-       Date().timeIntervalSince(at) < credsCacheTTL {
+       Date().timeIntervalSince(at) < credsCacheTTL,
+       !cached.isExpired {
         return cached
     }
 
@@ -105,6 +115,12 @@ func readCredentials(forceRefresh: Bool = false) -> Credentials? {
           let token = oauth["accessToken"] as? String
     else { return nil }
 
+    let refresh = oauth["refreshToken"] as? String ?? ""
+    var expiresAt: Date? = nil
+    if let expMs = oauth["expiresAt"] as? NSNumber {
+        expiresAt = Date(timeIntervalSince1970: expMs.doubleValue / 1000.0)
+    }
+
     let subType = oauth["subscriptionType"] as? String ?? ""
     let plan: String
     switch subType.lowercased() {
@@ -120,11 +136,118 @@ func readCredentials(forceRefresh: Bool = false) -> Credentials? {
     default: plan = subType.isEmpty ? "Unknown" : subType
     }
 
-    let creds = Credentials(accessToken: token, planName: plan)
+    let creds = Credentials(accessToken: token, refreshToken: refresh, expiresAt: expiresAt, planName: plan)
     _cachedCreds = creds
     _cachedCredsAt = Date()
-    Log.shared.info("Credentials loaded (\(plan))")
+    Log.shared.info("Credentials loaded (\(plan), expires \(expiresAt.map { "\($0)" } ?? "unknown"))")
     return creds
+}
+
+// MARK: - OAuth Token Refresh
+
+func refreshAccessToken(using refreshToken: String) async -> Bool {
+    guard !refreshToken.isEmpty else {
+        Log.shared.warn("No refresh token available")
+        return false
+    }
+
+    guard let url = URL(string: oauthTokenURL) else { return false }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+    let body = "grant_type=refresh_token&refresh_token=\(refreshToken)&client_id=\(oauthClientId)"
+    request.httpBody = body.data(using: .utf8)
+
+    let data: Data
+    let response: URLResponse
+    do {
+        (data, response) = try await apiSession.data(for: request)
+    } catch {
+        Log.shared.error("Token refresh network error: \(error.localizedDescription)")
+        return false
+    }
+
+    guard let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 else {
+        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+        Log.shared.error("Token refresh failed: HTTP \(code)")
+        return false
+    }
+
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let newAccessToken = json["access_token"] as? String
+    else {
+        Log.shared.error("Token refresh: bad response format")
+        return false
+    }
+
+    let newRefreshToken = json["refresh_token"] as? String ?? refreshToken
+    var newExpiresAt: Double? = nil
+    if let expiresIn = json["expires_in"] as? NSNumber {
+        newExpiresAt = Date().timeIntervalSince1970 * 1000.0 + expiresIn.doubleValue * 1000.0
+    }
+
+    // Update Keychain
+    if updateKeychainToken(accessToken: newAccessToken, refreshToken: newRefreshToken, expiresAtMs: newExpiresAt) {
+        _cachedCreds = nil
+        _cachedCredsAt = nil
+        Log.shared.info("Token refreshed successfully")
+        return true
+    }
+
+    return false
+}
+
+func updateKeychainToken(accessToken: String, refreshToken: String, expiresAtMs: Double?) -> Bool {
+    // Read current Keychain data
+    let readProc = Process()
+    readProc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    readProc.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-a", NSUserName(), "-w"]
+    let readPipe = Pipe()
+    readProc.standardOutput = readPipe
+    readProc.standardError = Pipe()
+    do { try readProc.run() } catch { return false }
+    readProc.waitUntilExit()
+    guard readProc.terminationStatus == 0 else { return false }
+
+    let raw = readPipe.fileHandleForReading.readDataToEndOfFile()
+    guard let jsonStr = String(data: raw, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          let jsonData = jsonStr.data(using: .utf8),
+          var json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+          var oauth = json["claudeAiOauth"] as? [String: Any]
+    else { return false }
+
+    // Update tokens
+    oauth["accessToken"] = accessToken
+    oauth["refreshToken"] = refreshToken
+    if let exp = expiresAtMs {
+        oauth["expiresAt"] = exp
+    }
+    json["claudeAiOauth"] = oauth
+
+    guard let updatedData = try? JSONSerialization.data(withJSONObject: json),
+          let updatedStr = String(data: updatedData, encoding: .utf8)
+    else { return false }
+
+    // Delete old entry and add updated one
+    let delProc = Process()
+    delProc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    delProc.arguments = ["delete-generic-password", "-s", "Claude Code-credentials", "-a", NSUserName()]
+    delProc.standardOutput = Pipe()
+    delProc.standardError = Pipe()
+    do { try delProc.run() } catch { return false }
+    delProc.waitUntilExit()
+
+    let addProc = Process()
+    addProc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    addProc.arguments = ["add-generic-password", "-s", "Claude Code-credentials", "-a", NSUserName(), "-w", updatedStr]
+    addProc.standardOutput = Pipe()
+    addProc.standardError = Pipe()
+    do { try addProc.run() } catch { return false }
+    addProc.waitUntilExit()
+
+    return addProc.terminationStatus == 0
 }
 
 // ============================================================
@@ -181,12 +304,26 @@ private let apiSession: URLSession = {
 }()
 
 func fetchUsage() async -> UsageData {
+    return await fetchUsageInner(allowRefresh: true)
+}
+
+private func fetchUsageInner(allowRefresh: Bool) async -> UsageData {
     var result = UsageData()
 
-    guard let creds = readCredentials() else {
+    guard var creds = readCredentials() else {
         result.error = "No token"
         result.errorKind = .noToken
         return result
+    }
+
+    // Proactively refresh if token is expired/expiring
+    if creds.isExpired && allowRefresh {
+        Log.shared.info("Token expired/expiring, refreshing proactively...")
+        if await refreshAccessToken(using: creds.refreshToken) {
+            if let newCreds = readCredentials(forceRefresh: true) {
+                creds = newCreds
+            }
+        }
     }
 
     result.planName = creds.planName
@@ -201,7 +338,7 @@ func fetchUsage() async -> UsageData {
     request.httpMethod = "GET"
     request.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("claude-code/2.1.5", forHTTPHeaderField: "User-Agent")
+    request.setValue("claude-code/2.1.38", forHTTPHeaderField: "User-Agent")
     request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
 
     let data: Data
@@ -243,6 +380,15 @@ func fetchUsage() async -> UsageData {
 
     if let httpResp = response as? HTTPURLResponse, httpResp.statusCode != 200 {
         let code = httpResp.statusCode
+
+        // On 401, try to refresh token and retry once
+        if code == 401 && allowRefresh {
+            Log.shared.info("Got 401, attempting token refresh...")
+            if await refreshAccessToken(using: creds.refreshToken) {
+                return await fetchUsageInner(allowRefresh: false)
+            }
+        }
+
         switch code {
         case 401:
             result.error = "Auth expired"
@@ -303,22 +449,49 @@ func fetchUsage() async -> UsageData {
 // MARK: - Sparkline History
 // ============================================================
 
-struct UsagePoint {
+struct UsagePoint: Codable {
     let date: Date
     let sessionPct: Double
-    let weeklyPct: Double
 }
 
 class UsageHistory {
-    static let maxPoints = 360  // 6h at 60s intervals
+    static let maxAge: TimeInterval = 5 * 3600  // 5h
     private(set) var points: [UsagePoint] = []
+    private let fileURL: URL
+
+    init() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let dir = home.appendingPathComponent("Library/Application Support/ClaudeUsageBar")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        fileURL = dir.appendingPathComponent("history.json")
+        load()
+    }
 
     func record(_ usage: UsageData) {
-        let pt = UsagePoint(date: Date(), sessionPct: usage.sessionPct, weeklyPct: usage.weeklyPct)
+        let pt = UsagePoint(date: Date(), sessionPct: usage.sessionPct)
         points.append(pt)
-        if points.count > Self.maxPoints {
-            points.removeFirst(points.count - Self.maxPoints)
-        }
+        prune()
+        save()
+    }
+
+    private func prune() {
+        let cutoff = Date().addingTimeInterval(-Self.maxAge)
+        points.removeAll { $0.date < cutoff }
+    }
+
+    private func save() {
+        guard let data = try? JSONEncoder().encode(points) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: fileURL),
+              var loaded = try? JSONDecoder().decode([UsagePoint].self, from: data)
+        else { return }
+        let cutoff = Date().addingTimeInterval(-Self.maxAge)
+        loaded.removeAll { $0.date < cutoff }
+        points = loaded
+        Log.shared.info("Loaded \(points.count) history points from disk")
     }
 }
 
@@ -346,7 +519,7 @@ class SparklineView: NSView {
             .font: NSFont.systemFont(ofSize: 9, weight: .medium),
             .foregroundColor: NSColor.secondaryLabelColor
         ]
-        "Trend".draw(at: NSPoint(x: margin, y: bounds.height - topPad + 2), withAttributes: titleAttrs)
+        "Session Trend (5h)".draw(at: NSPoint(x: margin, y: bounds.height - topPad + 2), withAttributes: titleAttrs)
 
         guard points.count >= 2 else {
             let attrs: [NSAttributedString.Key: Any] = [
@@ -374,11 +547,9 @@ class SparklineView: NSView {
             line.stroke()
         }
 
-        // Draw sparklines
+        // Draw session sparkline only
         drawLine(points.map { $0.sessionPct }, in: chartRect,
                  color: NSColor.systemBlue, label: "S", labelX: chartRect.maxX + 2)
-        drawLine(points.map { $0.weeklyPct }, in: chartRect,
-                 color: NSColor.systemOrange, label: "W", labelX: chartRect.maxX + 2)
 
         // Time labels
         let timeAttrs: [NSAttributedString.Key: Any] = [
@@ -655,9 +826,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startRefreshTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        // Align to next :00 or :30 second mark so countdown syncs with system clock
+        let now = Date()
+        let sec = Calendar.current.component(.second, from: now)
+        let secsToNext = sec < 30 ? (30 - sec) : (60 - sec)
+        let firstFire = now.addingTimeInterval(Double(secsToNext))
+        timer = Timer(fire: firstFire, interval: 30, repeats: true) { [weak self] _ in
             self?.refreshAsync()
         }
+        RunLoop.main.add(timer!, forMode: .common)
     }
 
     func ensureTimerAlive() {
@@ -736,8 +913,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let usage = lastUsage
         let hasError = usage.error != nil
 
+        // Always show last successful data during any error (not just transient)
         let displayUsage: UsageData
-        if hasError && usage.errorKind.isTransient, let stale = lastSuccessfulUsage {
+        if hasError, let stale = lastSuccessfulUsage {
             displayUsage = stale
         } else {
             displayUsage = usage
@@ -749,17 +927,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // -- Status bar button --
         if let btn = statusItem.button {
-            if hasError && lastSuccessfulFetch != nil && usage.errorKind.isTransient {
-                btn.image = makeBarImage(topFrac: topFrac, botFrac: botFrac)
-                btn.imagePosition = .imageLeft
-                btn.title = " \(usage.error!)"
-            } else if hasError {
+            if hasError && lastSuccessfulFetch == nil {
+                // Error with no prior data at all
                 btn.image = nil
                 btn.title = " C:\(usage.error!)"
             } else {
+                // Normal or stale — bars + countdown, tiny dot if error
                 btn.image = makeBarImage(topFrac: topFrac, botFrac: botFrac)
                 btn.imagePosition = .imageLeft
-                btn.title = countdown.isEmpty ? "" : " \(countdown)"
+                let suffix = hasError ? "·" : ""
+                btn.title = countdown.isEmpty ? suffix : " \(countdown)\(suffix)"
             }
             btn.font = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
         }
@@ -769,7 +946,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         headerItem.title = planName.isEmpty ? "Claude Usage" : "Claude Usage  ·  \(planName)"
 
         // Session & Weekly
-        let showUsageRows = !hasError || (lastSuccessfulFetch != nil && usage.errorKind.isTransient)
+        let showUsageRows = !hasError || lastSuccessfulFetch != nil
 
         if showUsageRows {
             sessionItem.isHidden = false
@@ -789,7 +966,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Stale note
-        if hasError && lastSuccessfulFetch != nil && usage.errorKind.isTransient {
+        if hasError && lastSuccessfulFetch != nil {
             staleNoteItem.isHidden = false
             staleNoteItem.title = "Last updated: \(formatTime(lastSuccessfulFetch))"
         } else {
