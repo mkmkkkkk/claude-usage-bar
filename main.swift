@@ -519,9 +519,9 @@ class SparklineView: NSView {
             .font: NSFont.systemFont(ofSize: 9, weight: .medium),
             .foregroundColor: NSColor.secondaryLabelColor
         ]
-        "Session Trend (5h)".draw(at: NSPoint(x: margin, y: bounds.height - topPad + 2), withAttributes: titleAttrs)
+        "Session Rate (5h)".draw(at: NSPoint(x: margin, y: bounds.height - topPad + 2), withAttributes: titleAttrs)
 
-        guard points.count >= 2 else {
+        guard points.count >= 3 else {
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 10),
                 .foregroundColor: NSColor.tertiaryLabelColor
@@ -535,21 +535,31 @@ class SparklineView: NSView {
             return
         }
 
-        // Grid lines at 50% and 100%
-        let gridColor = NSColor.separatorColor.withAlphaComponent(0.3)
-        for pct in [0.5, 1.0] {
-            let y = chartRect.minY + chartRect.height * CGFloat(pct)
-            let line = NSBezierPath()
-            line.move(to: NSPoint(x: chartRect.minX, y: y))
-            line.line(to: NSPoint(x: chartRect.maxX, y: y))
-            line.lineWidth = 0.5
-            gridColor.setStroke()
-            line.stroke()
+        // Compute rate: %/min between consecutive points
+        var rates: [Double] = []
+        for i in 1..<points.count {
+            let dt = points[i].date.timeIntervalSince(points[i-1].date)
+            guard dt > 0 else { rates.append(0); continue }
+            let delta = max(points[i].sessionPct - points[i-1].sessionPct, 0)
+            rates.append(delta / (dt / 60.0))  // %/min
         }
 
-        // Draw session sparkline only
-        drawLine(points.map { $0.sessionPct }, in: chartRect,
-                 color: NSColor.systemBlue, label: "S", labelX: chartRect.maxX + 2)
+        let maxRate = max(rates.max() ?? 1, 0.5)  // floor at 0.5%/min for scale
+
+        // Grid line at 50% of max
+        let gridColor = NSColor.separatorColor.withAlphaComponent(0.3)
+        let midY = chartRect.minY + chartRect.height * 0.5
+        let gridLine = NSBezierPath()
+        gridLine.move(to: NSPoint(x: chartRect.minX, y: midY))
+        gridLine.line(to: NSPoint(x: chartRect.maxX, y: midY))
+        gridLine.lineWidth = 0.5
+        gridColor.setStroke()
+        gridLine.stroke()
+
+        // Draw rate sparkline (normalized to maxRate)
+        let normalized = rates.map { $0 / maxRate * 100.0 }
+        drawLine(normalized, in: chartRect,
+                 color: NSColor.systemBlue, label: "", labelX: chartRect.maxX + 2)
 
         // Time labels
         let timeAttrs: [NSAttributedString.Key: Any] = [
