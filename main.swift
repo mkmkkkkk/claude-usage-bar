@@ -535,13 +535,23 @@ class SparklineView: NSView {
             return
         }
 
-        // Compute rate: %/min between consecutive points
-        var rates: [Double] = []
+        // Compute rate: %/min between consecutive points, then smooth with 5min rolling average
+        var rawRates: [Double] = []
         for i in 1..<points.count {
             let dt = points[i].date.timeIntervalSince(points[i-1].date)
-            guard dt > 0 else { rates.append(0); continue }
+            guard dt > 0 else { rawRates.append(0); continue }
             let delta = max(points[i].sessionPct - points[i-1].sessionPct, 0)
-            rates.append(delta / (dt / 60.0))  // %/min
+            rawRates.append(delta / (dt / 60.0))  // %/min
+        }
+
+        // Rolling average (window = 40 points ≈ 20min at 30s intervals)
+        let window = 40
+        var rates: [Double] = []
+        for i in 0..<rawRates.count {
+            let lo = max(0, i - window / 2)
+            let hi = min(rawRates.count - 1, i + window / 2)
+            let slice = rawRates[lo...hi]
+            rates.append(slice.reduce(0, +) / Double(slice.count))
         }
 
         let maxRate = max(rates.max() ?? 1, 0.5)  // floor at 0.5%/min for scale
